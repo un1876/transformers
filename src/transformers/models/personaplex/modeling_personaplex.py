@@ -4,6 +4,7 @@
 #             the file from the modular. If any change should be done, please apply the change to the
 #                          modular_personaplex.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
+
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -30,6 +31,27 @@ from .configuration_personaplex import PersonaplexConfig, PersonaplexDepthConfig
 
 
 logger = logging.get_logger(__name__)
+
+
+@auto_docstring
+@dataclass
+class PersonaplexUnconditionalInput(ModelOutput):
+    r"""
+    input_ids (`torch.Tensor `of shape `(batch_size, sequence_length), *optional*):
+        The sequence used as a text prompt for the generation.
+    user_audio_codes (`torch.Tensor `of shape `(batch_size, num_codebooks, sequence_length), *optional*):
+        The audio codes used as audio user prompt for the generation. Has priority over `user_input_values` and represents the audio "tokens" of `user_input_values` once passed through the audio encoder.
+    personaplex_audio_codes (`torch.Tensor `of shape `(batch_size, num_codebooks, sequence_length), *optional*):
+        The audio codes used as audio Personaplex prompt for the generation. Has priority over `personaplex_input_values` and represents the audio "tokens" of `personaplex_input_values` once passed through the audio encoder.
+    attention_mask (`torch.LongTensor`)  of shape `(batch_size, sequence_length)`, *optional*):
+        Attention mask to avoid performing attention on padding token indices. Mask values selected in `[0,
+        1]`: 1 for tokens that are **not masked**, 0 for tokens that are **masked**.
+    """
+
+    input_ids: torch.LongTensor | None = None
+    user_audio_codes: torch.Tensor | None = None
+    personaplex_audio_codes: torch.Tensor | None = None
+    attention_mask: torch.LongTensor | None = None
 
 
 class PersonaplexRMSNorm(nn.Module):
@@ -784,27 +806,6 @@ class PersonaplexConditionalGenerationOutputWithPast(ModelOutput):
     depth_attentions: tuple[torch.FloatTensor, ...] | None = None
 
 
-@auto_docstring
-@dataclass
-class PersonaplexUnconditionalInput(ModelOutput):
-    r"""
-    input_ids (`torch.Tensor `of shape `(batch_size, sequence_length), *optional*):
-        The sequence used as a text prompt for the generation.
-    user_audio_codes (`torch.Tensor `of shape `(batch_size, num_codebooks, sequence_length), *optional*):
-        The audio codes used as audio user prompt for the generation. Has priority over `user_input_values` and represents the audio "tokens" of `user_input_values` once passed through the audio encoder.
-    personaplex_audio_codes (`torch.Tensor `of shape `(batch_size, num_codebooks, sequence_length), *optional*):
-        The audio codes used as audio Personaplex prompt for the generation. Has priority over `personaplex_input_values` and represents the audio "tokens" of `personaplex_input_values` once passed through the audio encoder.
-    attention_mask (`torch.LongTensor`)  of shape `(batch_size, sequence_length)`, *optional*):
-        Attention mask to avoid performing attention on padding token indices. Mask values selected in `[0,
-        1]`: 1 for tokens that are **not masked**, 0 for tokens that are **masked**.
-    """
-
-    input_ids: torch.LongTensor | None = None
-    user_audio_codes: torch.Tensor | None = None
-    personaplex_audio_codes: torch.Tensor | None = None
-    attention_mask: torch.LongTensor | None = None
-
-
 class PersonaplexDepthDecoder(PersonaplexPreTrainedModel, GenerationMixin):
     """
     Transformer depth decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`PersonaplexTransformerLayer`]
@@ -1014,6 +1015,14 @@ class PersonaplexDepthDecoder(PersonaplexPreTrainedModel, GenerationMixin):
             hidden_states=past_key_values,
             attentions=all_self_attns,
         )
+
+
+# PersonaPlex prefill constants (models_lm.py.patch): per-frame constant Mimi tokens for
+# digital silence / a 440 Hz sine, precomputed for the 8-codebook moshiko Mimi. The original
+# tiles these instead of encoding real waveforms so the prefill is reproducible frame-for-frame.
+SILENCE_TOKENS = [948, 243, 1178, 546, 1736, 1030, 1978, 2008]
+SINE_TOKENS = [430, 1268, 381, 1611, 1095, 1495, 56, 472]
+ZERO_TEXT_CODE = 3
 
 
 @auto_docstring(
@@ -1890,6 +1899,94 @@ class PersonaplexForConditionalGeneration(PersonaplexPreTrainedModel, Generation
                 )
 
         return input_ids, user_audio_codes, personaplex_audio_codes, concat_unconditional_inputs
+
+    def build_persona_prompt(
+        self,
+        voice_input_values: torch.FloatTensor | None = None,
+        persona_input_ids: torch.LongTensor | None = None,
+        silence_tokens: list[int] | None = None,
+        sine_tokens: list[int] | None = None,
+        zero_text_code: int = ZERO_TEXT_CODE,
+        pre_silence_frames: int = 6,
+        post_silence_frames: int = 6,
+    ):
+        """
+        Builds the PersonaPlex persona prefill (`voice -> silence -> persona text -> silence`) that
+        conditions generation on a target voice and/or a text role prompt, faithful to the original
+        `step_system_prompts`. The result can be passed directly to `generate`.
+
+        Args:
+            voice_input_values (`torch.FloatTensor` of shape `(sequence_length,)` or `(1, 1, sequence_length)`, *optional*):
+                Voice reference waveform (24kHz mono, -24 LUFS recommended). Encoded with the audio
+                encoder and placed on the Personaplex (agent) stream.
+            persona_input_ids (`torch.LongTensor` of shape `(sequence_length,)` or `(1, sequence_length)`, *optional*):
+                Tokenized persona/role text (one token per frame on the text stream).
+            silence_tokens (`list[int]`, *optional*, defaults to the moshiko constants):
+                Per-codebook Mimi tokens for digital silence, tiled on the agent stream after the voice.
+            sine_tokens (`list[int]`, *optional*, defaults to the moshiko constants):
+                Per-codebook Mimi tokens for the 440 Hz sine, tiled on the whole user stream.
+            zero_text_code (`int`, *optional*, defaults to 3):
+                Text padding code used on the text stream outside the persona tokens.
+            pre_silence_frames (`int`, *optional*, defaults to 6):
+                Silence frames between voice and text segments (original serving uses 0.5s = 6 frames).
+            post_silence_frames (`int`, *optional*, defaults to 6):
+                Silence frames after the text segment.
+
+        Example:
+        ```python
+        >>> inputs = model.build_persona_prompt(voice_input_values=voice, persona_input_ids=ids)
+        >>> out = model.generate(**inputs, max_new_tokens=125)
+        ```"""
+        if voice_input_values is None and persona_input_ids is None:
+            raise ValueError("At least one of `voice_input_values` or `persona_input_ids` must be provided.")
+
+        silence_tokens = SILENCE_TOKENS if silence_tokens is None else silence_tokens
+        sine_tokens = SINE_TOKENS if sine_tokens is None else sine_tokens
+        if len(silence_tokens) != self.num_codebooks or len(sine_tokens) != self.num_codebooks:
+            raise ValueError(
+                f"`silence_tokens`/`sine_tokens` must have `num_codebooks={self.num_codebooks}` entries, "
+                f"got {len(silence_tokens)} and {len(sine_tokens)}."
+            )
+
+        device = self.device
+        if voice_input_values is not None:
+            voice_input_values = voice_input_values.view(1, 1, -1).to(device=device, dtype=self.dtype)
+            frame_size = int(self.config.sampling_rate / self.config.audio_encoder_config.frame_rate)
+            remainder = voice_input_values.shape[-1] % frame_size
+            if remainder:
+                voice_input_values = torch.nn.functional.pad(voice_input_values, (0, frame_size - remainder))
+            with torch.no_grad():
+                voice_codes = self.audio_encoder.encode(voice_input_values, num_quantizers=self.num_codebooks)[0]
+            num_voice_frames = voice_codes.shape[2]
+        else:
+            num_voice_frames = 0
+
+        if persona_input_ids is not None:
+            persona_input_ids = persona_input_ids.view(1, -1).to(device)
+        num_text_frames = 0 if persona_input_ids is None else persona_input_ids.shape[1]
+
+        num_frames = num_voice_frames + pre_silence_frames + num_text_frames + post_silence_frames
+
+        silence_frame = torch.tensor(silence_tokens, dtype=torch.long, device=device).view(1, -1, 1)
+        sine_frame = torch.tensor(sine_tokens, dtype=torch.long, device=device).view(1, -1, 1)
+
+        personaplex_audio_codes = silence_frame.repeat(1, 1, num_frames - num_voice_frames)
+        if num_voice_frames:
+            personaplex_audio_codes = torch.cat([voice_codes, personaplex_audio_codes], dim=2)
+        user_audio_codes = sine_frame.repeat(1, 1, num_frames)
+
+        input_ids = torch.full((1, num_frames), zero_text_code, dtype=torch.long, device=device)
+        if num_text_frames:
+            text_start = num_voice_frames + pre_silence_frames
+            input_ids[:, text_start : text_start + num_text_frames] = persona_input_ids
+        attention_mask = torch.ones((1, num_frames), dtype=torch.long, device=device)
+
+        return PersonaplexUnconditionalInput(
+            input_ids=input_ids,
+            user_audio_codes=user_audio_codes,
+            personaplex_audio_codes=personaplex_audio_codes,
+            attention_mask=attention_mask,
+        )
 
 
 __all__ = [

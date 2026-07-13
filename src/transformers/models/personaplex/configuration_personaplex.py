@@ -52,7 +52,7 @@ class PersonaplexDepthConfig(PreTrainedConfig):
     num_attention_heads: int = 16
     num_key_value_heads: int | None = None
     audio_vocab_size: int = 2048
-    max_position_embeddings: int = 9
+    max_position_embeddings: int = 17
     hidden_act: str = "silu"
     head_dim: int | None = None
     initializer_range: float = 0.02
@@ -61,7 +61,10 @@ class PersonaplexDepthConfig(PreTrainedConfig):
     attention_dropout: float | int = 0.0
     ffn_dim: int = 5632
     rms_norm_eps: float = 1e-8
-    num_codebooks: int = 8
+    # PersonaPlex trains its depth decoder with dep_q=16: it predicts both the agent
+    # stream (slices 0..7) and the user stream (slices 8..15), while the audio streams
+    # themselves keep 8 codebooks each. 17 positions = 1 text token + 16 audio tokens.
+    num_codebooks: int = 16
     tie_word_embeddings: bool = False
     pad_token_id: int | None = None
     bos_token_id: int | None = None
@@ -163,12 +166,13 @@ class PersonaplexConfig(PreTrainedConfig):
         )
 
         if isinstance(self.depth_decoder_config, dict):
+            # Unlike Moshi, `num_codebooks` is not propagated from the main config to the
+            # depth decoder: the depth decoder predicts `2 * num_codebooks` slices (dep_q=16).
             self.depth_decoder_config.update(
                 {
                     "audio_vocab_size": self.audio_vocab_size,
                     "input_size": self.hidden_size,
                     "vocab_size": self.vocab_size,
-                    "num_codebooks": self.num_codebooks,
                 }
             )
             self.depth_decoder_config = PersonaplexDepthConfig(**self.depth_decoder_config)
