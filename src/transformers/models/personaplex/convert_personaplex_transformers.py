@@ -39,6 +39,7 @@ Resource notes: ~17 GB download, ~35 GB peak CPU RAM.
 from __future__ import annotations
 
 import argparse
+import gc
 import re
 import tarfile
 from pathlib import Path
@@ -354,17 +355,23 @@ def convert(
         print("[dry-run] stopping before model materialization")
         return
 
-    print(f"[3/6] building Personaplex skeleton + grafting Mimi from {base_checkpoint}")
+    # Grafting the Mimi weights and materializing the dep_q=16 skeleton one 7B model at
+    # a time keeps the peak CPU RAM near ~30 GB instead of ~45 GB (two 7B models + source).
+    print(f"[3/6] grafting Mimi from {base_checkpoint}", flush=True)
     try:
         base = MoshiForConditionalGeneration.from_pretrained(base_checkpoint, dtype=torch.bfloat16)
     except TypeError:  # older transformers uses torch_dtype=
         base = MoshiForConditionalGeneration.from_pretrained(base_checkpoint, torch_dtype=torch.bfloat16)
-    model = PersonaplexForConditionalGeneration._from_config(config, dtype=torch.bfloat16)
-    # PersonaPlex ships the byte-identical Mimi file as stock Moshi (same sha256).
-    state_dict.update({f"audio_encoder.{k}": v for k, v in base.audio_encoder.state_dict().items()})
+    # PersonaPlex ships the byte-identical Mimi file as stock Moshi (same sha256); keep only
+    # the Mimi tensors (cloned so they survive `del base`), then free the rest of the base.
+    state_dict.update({f"audio_encoder.{k}": v.clone() for k, v in base.audio_encoder.state_dict().items()})
     del base
+    gc.collect()
 
-    print("[4/6] converting layout (official HF mapping, strict key check)")
+    print("[3/6] materializing the Personaplex skeleton (dep_q=16)", flush=True)
+    model = PersonaplexForConditionalGeneration._from_config(config, dtype=torch.bfloat16)
+
+    print("[4/6] converting layout (official HF mapping, strict key check)", flush=True)
     with torch.no_grad():
         _convert_model(
             state_dict,
@@ -375,7 +382,7 @@ def convert(
             allowed_missing=_hf_missing_keys(left_missing, convert_list),
         )
 
-    print("[5/6] writing generation defaults")
+    print("[5/6] writing generation defaults", flush=True)
     model.generation_config.do_sample = True
     model.generation_config.temperature = TEXT_TEMPERATURE
     model.generation_config.top_k = TEXT_TOP_K
@@ -390,7 +397,7 @@ def convert(
         "top_k": AUDIO_TOP_K,
     }
 
-    print(f"[6/6] saving to {out_dir}")
+    print(f"[6/6] saving to {out_dir} (writing ~15 GB, this takes a minute or two)", flush=True)
     out_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(out_dir))
     AutoTokenizer.from_pretrained(base_checkpoint).save_pretrained(str(out_dir))

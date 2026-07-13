@@ -1988,6 +1988,66 @@ class PersonaplexForConditionalGeneration(PersonaplexPreTrainedModel, Generation
             attention_mask=attention_mask,
         )
 
+    def build_dialogue_prompt(
+        self,
+        user_input_values: torch.FloatTensor,
+        persona_prompt=None,
+        silence_tokens: list[int] | None = None,
+        zero_text_code: int = ZERO_TEXT_CODE,
+    ):
+        """
+        Builds a prefill that makes the model respond to a user turn: the user's audio goes on the
+        user stream while the agent stream stays silent. If `persona_prompt` (the output of
+        [`~PersonaplexForConditionalGeneration.build_persona_prompt`]) is given, it is prepended so
+        the response comes out in the cloned voice/role. The result can be passed directly to
+        `generate`; the generated frames after the prefill are the answer.
+
+        Args:
+            user_input_values (`torch.FloatTensor` of shape `(sequence_length,)` or `(1, 1, sequence_length)`):
+                The user's question waveform (24kHz mono, -24 LUFS recommended).
+            persona_prompt ([`PersonaplexUnconditionalInput`], *optional*):
+                Persona prefill to prepend (voice cloning / role conditioning).
+            silence_tokens (`list[int]`, *optional*, defaults to the moshiko constants):
+                Per-codebook Mimi tokens for digital silence on the agent stream.
+            zero_text_code (`int`, *optional*, defaults to 3):
+                Text padding code used on the text stream.
+        """
+        silence_tokens = SILENCE_TOKENS if silence_tokens is None else silence_tokens
+        if len(silence_tokens) != self.num_codebooks:
+            raise ValueError(
+                f"`silence_tokens` must have `num_codebooks={self.num_codebooks}` entries, got {len(silence_tokens)}."
+            )
+
+        device = self.device
+        user_input_values = user_input_values.view(1, 1, -1).to(device=device, dtype=self.dtype)
+        frame_size = int(self.config.sampling_rate / self.config.audio_encoder_config.frame_rate)
+        remainder = user_input_values.shape[-1] % frame_size
+        if remainder:
+            user_input_values = torch.nn.functional.pad(user_input_values, (0, frame_size - remainder))
+        with torch.no_grad():
+            user_audio_codes = self.audio_encoder.encode(user_input_values, num_quantizers=self.num_codebooks)[0]
+        num_frames = user_audio_codes.shape[2]
+
+        silence_frame = torch.tensor(silence_tokens, dtype=torch.long, device=device).view(1, -1, 1)
+        personaplex_audio_codes = silence_frame.repeat(1, 1, num_frames)
+        input_ids = torch.full((1, num_frames), zero_text_code, dtype=torch.long, device=device)
+        attention_mask = torch.ones((1, num_frames), dtype=torch.long, device=device)
+
+        if persona_prompt is not None:
+            input_ids = torch.cat([persona_prompt.input_ids.to(device), input_ids], dim=1)
+            user_audio_codes = torch.cat([persona_prompt.user_audio_codes.to(device), user_audio_codes], dim=2)
+            personaplex_audio_codes = torch.cat(
+                [persona_prompt.personaplex_audio_codes.to(device), personaplex_audio_codes], dim=2
+            )
+            attention_mask = torch.cat([persona_prompt.attention_mask.to(device), attention_mask], dim=1)
+
+        return PersonaplexUnconditionalInput(
+            input_ids=input_ids,
+            user_audio_codes=user_audio_codes,
+            personaplex_audio_codes=personaplex_audio_codes,
+            attention_mask=attention_mask,
+        )
+
 
 __all__ = [
     "PersonaplexModel",
